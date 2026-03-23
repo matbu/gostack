@@ -29,8 +29,12 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "fake-openstack",
 		Short: "Fake OpenStack API server for integration tests",
-		Long:  "Starts a mock OpenStack API (Keystone, Nova, Neutron, Cinder, Glance) for OS-to-OS and VMware-to-OS migration integration tests.",
-		Run:   runServe,
+		Long: `Starts a mock OpenStack API (Keystone, Nova, Neutron, Cinder, Glance) for OS-to-OS and VMware-to-OS migration integration tests.
+
+Use from CI or Ansible playbooks with: go run github.com/os-migrate/gostack/cmd/fake-openstack@latest --port 5000 --pid-file /tmp/fake_os_server.pid
+
+Runs from any directory; no chdir required.`,
+		Run: runServe,
 	}
 
 	rootCmd.PersistentFlags().IntP("port", "p", 5000, "Port to listen on")
