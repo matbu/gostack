@@ -23,7 +23,7 @@ var (
 	mu       sync.Mutex
 	tokenMu  sync.RWMutex
 	domains  = map[string]*Domain{
-		"default": {ID: "default", Name: "default"},
+		"default": {ID: "default", Name: "default", Enabled: true},
 	}
 	users    = map[string]*User{}
 	projects = map[string]*Project{
@@ -35,7 +35,6 @@ var (
 		"admin":  {ID: "admin", Name: "admin"},
 	}
 	tokenProjects = map[string]string{}
-	seq           = 1
 )
 
 /* ============================
@@ -53,7 +52,8 @@ var (
 	flavorExtraSpecs = map[string]map[string]string{
 		"osm_flavor": {},
 	}
-	keypairs = []map[string]interface{}{}
+	flavorSeq = 3
+	keypairs  = []map[string]interface{}{}
 )
 
 /* ============================
@@ -82,6 +82,9 @@ var images = []map[string]interface{}{
 var (
 	networks = []map[string]interface{}{
 		{"id": "net-1", "name": "private", "project_id": "demo"},
+		// External provider network used as the router gateway in func tests.
+		{"id": "public", "name": "public", "project_id": "demo",
+			"router:external": true, "shared": true, "status": "ACTIVE"},
 	}
 	subnets = []map[string]interface{}{}
 	ports   = []map[string]interface{}{

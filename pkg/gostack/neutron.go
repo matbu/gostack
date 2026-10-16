@@ -39,6 +39,7 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 
 			filtered := []map[string]interface{}{}
 			for _, n := range networks {
+				enrichNetwork(n, tokenProject)
 				// Project filtering (multi-tenant requirement)
 				if projectFilter != "" {
 					if n["project_id"] == projectFilter {
@@ -74,7 +75,7 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 					continue
 				}
 				// Check shared networks with name/status filters
-				if isShared, ok := n["is_shared"].(bool); ok && isShared {
+				if isShared, ok := n["shared"].(bool); ok && isShared {
 					if nameFilter != "" {
 						if netName, ok := n["name"].(string); !ok || netName != nameFilter {
 							continue
@@ -107,23 +108,7 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 
 			network := req.Network
 			network["id"] = fmt.Sprintf("net-%d", len(networks)+1)
-
-			// Neutron defaults
-			if _, ok := network["admin_state_up"]; !ok {
-				network["admin_state_up"] = true
-			}
-			if _, ok := network["status"]; !ok {
-				network["status"] = "ACTIVE"
-			}
-			if _, ok := network["mtu"]; !ok {
-				network["mtu"] = 1500
-			}
-			if _, ok := network["revision_number"]; !ok {
-				network["revision_number"] = 1
-			}
-			if _, ok := network["project_id"]; !ok {
-				network["project_id"] = ProjectIDFromToken(r)
-			}
+			enrichNetwork(network, ProjectIDFromToken(r))
 			networks = append(networks, network)
 
 			w.WriteHeader(http.StatusCreated)
@@ -140,29 +125,58 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	})
 
-	// GET /v2.0/networks/{id}
+	// GET/PUT/DELETE /v2.0/networks/{id} (+ /tags sub-resource)
 	mux.HandleFunc("/v2.0/networks/", func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Path[len("/v2.0/networks/"):]
+		w.Header().Set("Content-Type", "application/json")
+		parts := Parts(r.URL.Path)
+		id := parts[2]
 		mu.Lock()
 		defer mu.Unlock()
 		projectID := ProjectIDFromToken(r)
 
-		for _, n := range networks {
+		for i, n := range networks {
 			if n["id"] == id {
+				enrichNetwork(n, projectID)
+				if handleTags(w, r, parts, n) {
+					return
+				}
 				if n["project_id"] != projectID {
-					if isShared, ok := n["is_shared"].(bool); !ok || !isShared {
+					if shared, ok := n["shared"].(bool); !ok || !shared {
 						http.NotFound(w, r)
 						return
 					}
 				}
-				err := json.NewEncoder(w).Encode(map[string]interface{}{
-					"network": n,
-				})
-				if err != nil {
-					log.Printf("Error encoding JSON response: %v", err)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				switch r.Method {
+				case http.MethodDelete:
+					networks = append(networks[:i], networks[i+1:]...)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				case http.MethodPut:
+					var req struct {
+						Network map[string]interface{} `json:"network"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					for k, v := range req.Network {
+						n[k] = v
+					}
+					if rev, ok := n["revision_number"].(int); ok {
+						n["revision_number"] = rev + 1
+					}
+					networks[i] = n
+					if err := json.NewEncoder(w).Encode(map[string]interface{}{"network": n}); err != nil {
+						log.Printf("Error encoding JSON response: %v", err)
+					}
+					return
+				default:
+					if err := json.NewEncoder(w).Encode(map[string]interface{}{"network": n}); err != nil {
+						log.Printf("Error encoding JSON response: %v", err)
+						http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+					}
+					return
 				}
-				return
 			}
 		}
 
@@ -308,25 +322,48 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 	// GET /v2.0/subnets/{id}
 	mux.HandleFunc("/v2.0/subnets/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		id := r.URL.Path[len("/v2.0/subnets/"):]
+		parts := Parts(r.URL.Path)
+		if len(parts) < 3 || parts[2] == "" {
+			http.NotFound(w, r)
+			return
+		}
+		id := parts[2]
 		mu.Lock()
 		defer mu.Unlock()
 		projectID := ProjectIDFromToken(r)
 
-		for _, s := range subnets {
+		for i, s := range subnets {
 			if s["id"] == id {
 				if s["project_id"] != projectID {
 					http.NotFound(w, r)
 					return
 				}
-				err := json.NewEncoder(w).Encode(map[string]interface{}{
-					"subnet": s,
-				})
-				if err != nil {
-					log.Printf("Error encoding JSON response: %v", err)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				if handleTags(w, r, parts, s) {
+					return
 				}
-				return
+				switch r.Method {
+				case http.MethodDelete:
+					subnets = append(subnets[:i], subnets[i+1:]...)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				case http.MethodPut:
+					var req struct {
+						Subnet map[string]interface{} `json:"subnet"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					for k, v := range req.Subnet {
+						s[k] = v
+					}
+					subnets[i] = s
+					writeJSON(w, map[string]interface{}{"subnet": s})
+					return
+				default:
+					writeJSON(w, map[string]interface{}{"subnet": s})
+					return
+				}
 			}
 		}
 
@@ -443,34 +480,39 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 		defer mu.Unlock()
 		projectID := ProjectIDFromToken(r)
 
-		for _, p := range ports {
+		for i, p := range ports {
 			if p["id"] == id {
 				if p["project_id"] != projectID {
 					http.NotFound(w, r)
 					return
 				}
-				err := json.NewEncoder(w).Encode(map[string]interface{}{
-					"port": p,
-				})
-				if err != nil {
-					log.Printf("Error encoding JSON response: %v", err)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				switch r.Method {
+				case http.MethodDelete:
+					ports = append(ports[:i], ports[i+1:]...)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				case http.MethodPut:
+					var req struct {
+						Port map[string]interface{} `json:"port"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					for k, v := range req.Port {
+						p[k] = v
+					}
+					ports[i] = p
+					writeJSON(w, map[string]interface{}{"port": p})
+					return
+				default:
+					writeJSON(w, map[string]interface{}{"port": p})
+					return
 				}
-				return
 			}
 		}
 
 		http.NotFound(w, r)
-	})
-
-	// GET /v2.0/security-groups
-	mux.HandleFunc("/v2.0/security-groups", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(map[string]interface{}{"security_groups": neutronSecGroups})
-		if err != nil {
-			log.Printf("Error encoding JSON response: %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
 	})
 
 	// GET /v2.0/floatingips
@@ -488,4 +530,48 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 		}
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	})
+
+	registerNeutronRouters(mux)
+	registerNeutronSecurityGroups(mux)
+}
+
+// setDefault sets m[key]=val only if key is absent.
+func setDefault(m map[string]interface{}, key string, val interface{}) {
+	if _, ok := m[key]; !ok {
+		m[key] = val
+	}
+}
+
+// enrichNetwork fills a network object with the full set of fields that
+// openstacksdk's Network resource expects, so export/serialization never sees
+// a missing (nil) list/attribute. Idempotent: only fills absent keys.
+func enrichNetwork(n map[string]interface{}, projectID string) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	setDefault(n, "admin_state_up", true)
+	setDefault(n, "status", "ACTIVE")
+	setDefault(n, "mtu", 1500)
+	setDefault(n, "revision_number", 1)
+	setDefault(n, "description", "")
+	setDefault(n, "created_at", now)
+	setDefault(n, "updated_at", now)
+	setDefault(n, "shared", false)
+	setDefault(n, "is_default", false)
+	setDefault(n, "port_security_enabled", true)
+	setDefault(n, "router:external", false)
+	setDefault(n, "vlan_transparent", nil)
+	setDefault(n, "dns_domain", nil)
+	setDefault(n, "qos_policy_id", nil)
+	setDefault(n, "provider:network_type", nil)
+	setDefault(n, "provider:physical_network", nil)
+	setDefault(n, "provider:segmentation_id", nil)
+	// Lists must never be nil.
+	setDefault(n, "subnets", []interface{}{})
+	setDefault(n, "availability_zones", []interface{}{})
+	setDefault(n, "availability_zone_hints", []interface{}{})
+	setDefault(n, "segments", nil)
+	setDefault(n, "tags", []interface{}{})
+	if projectID != "" {
+		setDefault(n, "project_id", projectID)
+		setDefault(n, "tenant_id", n["project_id"])
+	}
 }

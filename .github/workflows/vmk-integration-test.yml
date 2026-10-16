@@ -1,0 +1,70 @@
+name: VMK integration tests
+
+# Runs the vmware-migration-kit (VMK) integration suite against the gostack build
+#
+# VMK drives gostack via tests/integration/scripts/prelude.sh, which clones and
+# starts gostack from its main branch.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  vmk-integration:
+    name: vmware-migration-kit integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out gostack (this PR)
+        uses: actions/checkout@v4
+
+      - name: Check out vmware-migration-kit (main)
+        uses: actions/checkout@v4
+        with:
+          repository: os-migrate/vmware-migration-kit
+          ref: main
+          path: vmware-migration-kit
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # VMK's build is the more demanding one; its Go version also builds
+          # gostack (Go is backward compatible with older language versions).
+          go-version-file: vmware-migration-kit/go.mod
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Build this PR's gostack
+        run: go build -v -o bin/fake-openstack ./cmd/fake-openstack
+
+      - name: Run VMK integration tests against this gostack
+        working-directory: vmware-migration-kit
+        run: |
+          set -euo pipefail
+          # Start this PR's gostack so VMK's prelude.sh reuses it (skips its own
+          # clone/build of gostack main). Keep it in this step so the process
+          # stays alive for the whole test run.
+          "${GITHUB_WORKSPACE}/bin/fake-openstack" \
+            --port 5000 --pid-file /tmp/fake_os_server.pid \
+            > /tmp/gostack.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:5000/v3 >/dev/null && break
+            sleep 1
+          done
+          if ! curl -sf http://127.0.0.1:5000/v3 >/dev/null; then
+            echo "ERROR: this PR's gostack failed to start"; cat /tmp/gostack.log; exit 1
+          fi
+          echo "Using this PR's gostack on :5000 (pid $(cat /tmp/fake_os_server.pid))"
+          make integration-test
