@@ -17,9 +17,24 @@
 package gostack
 
 import (
+	"log"
 	"net/http"
 	"strings"
 )
+
+// Recover wraps a handler so a panic in request handling returns 500 instead of
+// killing the connection (which clients see as a reset / RemoteDisconnected).
+func Recover(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic serving %s %s: %v", r.Method, r.URL.Path, rec)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
 // NormalizeV2Path fixes double /v2.0/v2.0/ in paths.
 func NormalizeV2Path(next http.Handler) http.Handler {

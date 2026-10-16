@@ -22,8 +22,10 @@ package gostack
 
 // Domain represents a Keystone domain.
 type Domain struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Enabled     bool   `json:"enabled"`
 }
 
 // User represents a Keystone user.
@@ -32,18 +34,41 @@ type User struct {
 	Name             string            `json:"name"`
 	DomainID         string            `json:"domain_id"`
 	DefaultProjectID string            `json:"default_project_id,omitempty"`
+	Email            string            `json:"email,omitempty"`
+	Description      string            `json:"description,omitempty"`
 	Enabled          bool              `json:"enabled"`
 	Federated        []interface{}     `json:"federated"`
 	Links            map[string]string `json:"links"`
 	PasswordExpires  *string           `json:"password_expires_at"`
 }
 
+// toMap renders a User as the map keystone returns (stable field set).
+func (u *User) toMap(baseURL string) map[string]interface{} {
+	return map[string]interface{}{
+		"id": u.ID, "name": u.Name, "domain_id": u.DomainID,
+		"default_project_id": u.DefaultProjectID, "enabled": u.Enabled,
+		"email": u.Email, "description": u.Description,
+		"federated":           []interface{}{},
+		"links":               map[string]string{"self": baseURL + "/v3/users/" + u.ID},
+		"password_expires_at": nil,
+	}
+}
+
 // Project represents a Keystone project.
 type Project struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	DomainID string `json:"domain_id"`
-	Enabled  bool   `json:"enabled"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	DomainID    string `json:"domain_id"`
+	Description string `json:"description"`
+	Enabled     bool   `json:"enabled"`
+}
+
+// toMap renders a Project as the map keystone returns.
+func (p *Project) toMap() map[string]interface{} {
+	return map[string]interface{}{
+		"id": p.ID, "name": p.Name, "domain_id": p.DomainID,
+		"description": p.Description, "enabled": p.Enabled,
+	}
 }
 
 // Role represents a Keystone role.

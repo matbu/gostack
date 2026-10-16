@@ -100,7 +100,7 @@ func NewFakeServer(opts Options) *FakeServer {
 
 	go func() {
 		log.Printf("Fake OpenStack API listening on %s", addr)
-		err := http.ListenAndServe(addr, NormalizeV2Path(mux))
+		err := http.ListenAndServe(addr, Recover(NormalizeV2Path(mux)))
 		if err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}

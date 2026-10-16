@@ -26,6 +26,41 @@ import (
 	"time"
 )
 
+// enrichKeypair fills a keypair with the fields Nova returns, so export can
+// serialize it. When no public_key is supplied (Nova would generate one), a
+// deterministic fake key pair is produced. Idempotent.
+func enrichKeypair(kp map[string]interface{}, projectID string) {
+	name, _ := kp["name"].(string)
+	if _, ok := kp["public_key"]; !ok || kp["public_key"] == "" {
+		kp["public_key"] = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDfake" + name + " gostack@fake"
+		kp["private_key"] = "-----BEGIN RSA PRIVATE KEY-----\nFAKE\n-----END RSA PRIVATE KEY-----\n"
+	}
+	setDefault(kp, "fingerprint", "fa:ke:fi:ng:er:pr:in:t0")
+	setDefault(kp, "type", "ssh")
+	setDefault(kp, "created_at", time.Now().UTC().Format(time.RFC3339))
+	setDefault(kp, "deleted", false)
+	setDefault(kp, "user_id", "demo-user")
+	if projectID != "" {
+		setDefault(kp, "project_id", projectID)
+	}
+}
+
+// enrichFlavor fills a flavor with Nova's standard fields. Idempotent.
+func enrichFlavor(f map[string]interface{}) {
+	if _, ok := f["id"]; !ok || f["id"] == "" || f["id"] == nil {
+		flavorSeq++
+		f["id"] = fmt.Sprintf("flavor-%d", flavorSeq)
+	}
+	setDefault(f, "swap", "")
+	setDefault(f, "rxtx_factor", 1.0)
+	setDefault(f, "OS-FLV-EXT-DATA:ephemeral", 0)
+	setDefault(f, "OS-FLV-DISABLED:disabled", false)
+	setDefault(f, "os-flavor-access:is_public", true)
+	setDefault(f, "disk", 0)
+	setDefault(f, "ram", 0)
+	setDefault(f, "vcpus", 1)
+}
+
 // RegisterNovaHandlers registers Nova (compute) API handlers on mux.
 func RegisterNovaHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/v2.1", func(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +102,21 @@ func RegisterNovaHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/v2.1/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.String())
 		p := Parts(r.URL.Path)
+		// Project-scoped compute root: GET /v2.1/{project} — novaclient does
+		// endpoint version discovery here before any API call.
+		if len(p) == 2 {
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(w, map[string]interface{}{
+				"version": map[string]interface{}{
+					"id": "v2.1", "status": "CURRENT", "min_version": "2.1",
+					"version": "2.90", "updated": "2023-01-01T00:00:00Z",
+					"links": []map[string]string{
+						{"rel": "self", "href": baseURL + "/v2.1/"},
+					},
+				},
+			})
+			return
+		}
 		if len(p) < 3 {
 			http.NotFound(w, r)
 			return
@@ -94,6 +144,24 @@ func RegisterNovaHandlers(mux *http.ServeMux) {
 					}
 					return
 				}
+				if r.Method == http.MethodPost {
+					var req struct {
+						Flavor map[string]interface{} `json:"flavor"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						http.Error(w, "invalid JSON body", http.StatusBadRequest)
+						return
+					}
+					f := req.Flavor
+					enrichFlavor(f)
+					mu.Lock()
+					flavors = append(flavors, f)
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					writeJSON(w, map[string]interface{}{"flavor": f})
+					return
+				}
 				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
@@ -112,18 +180,59 @@ func RegisterNovaHandlers(mux *http.ServeMux) {
 			}
 			if len(p) == 4 {
 				flavorID := p[3]
-				for _, f := range flavors {
+				mu.Lock()
+				defer mu.Unlock()
+				for i, f := range flavors {
 					if f["id"] == flavorID {
 						w.Header().Set("Content-Type", "application/json")
-						err := json.NewEncoder(w).Encode(map[string]interface{}{"flavor": f})
-						if err != nil {
-							log.Printf("Error encoding JSON response: %v", err)
-							http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+						switch r.Method {
+						case http.MethodDelete:
+							flavors = append(flavors[:i], flavors[i+1:]...)
+							delete(flavorExtraSpecs, flavorID)
+							w.WriteHeader(http.StatusAccepted)
+						default:
+							writeJSON(w, map[string]interface{}{"flavor": f})
 						}
 						return
 					}
 				}
 				http.NotFound(w, r)
+				return
+			}
+			// Individual extra spec: /flavors/{id}/os-extra_specs/{key}
+			if len(p) == 6 && p[4] == "os-extra_specs" {
+				flavorID := p[3]
+				key := p[5]
+				mu.Lock()
+				defer mu.Unlock()
+				if _, ok := flavorExtraSpecs[flavorID]; !ok {
+					flavorExtraSpecs[flavorID] = map[string]string{}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				switch r.Method {
+				case http.MethodGet:
+					val, ok := flavorExtraSpecs[flavorID][key]
+					if !ok {
+						http.NotFound(w, r)
+						return
+					}
+					writeJSON(w, map[string]string{key: val})
+				case http.MethodPut:
+					var body map[string]string
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						http.Error(w, "invalid JSON body", http.StatusBadRequest)
+						return
+					}
+					for k, v := range body {
+						flavorExtraSpecs[flavorID][k] = v
+					}
+					writeJSON(w, map[string]string{key: flavorExtraSpecs[flavorID][key]})
+				case http.MethodDelete:
+					delete(flavorExtraSpecs[flavorID], key)
+					w.WriteHeader(http.StatusOK)
+				default:
+					http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				}
 				return
 			}
 			if len(p) == 5 && p[4] == "os-extra_specs" {
@@ -730,13 +839,37 @@ func RegisterNovaHandlers(mux *http.ServeMux) {
 			return
 
 		case "os-keypairs":
-			if r.Method == http.MethodGet {
-				w.Header().Set("Content-Type", "application/json")
-				err := json.NewEncoder(w).Encode(map[string]interface{}{"keypairs": keypairs})
-				if err != nil {
-					log.Printf("Error encoding JSON response: %v", err)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			mu.Lock()
+			defer mu.Unlock()
+
+			// /v2.1/{proj}/os-keypairs/{name}
+			if len(p) >= 4 {
+				name := p[3]
+				for i, kp := range keypairs {
+					if kp["name"] == name {
+						switch r.Method {
+						case http.MethodGet:
+							writeJSON(w, map[string]interface{}{"keypair": kp})
+						case http.MethodDelete:
+							keypairs = append(keypairs[:i], keypairs[i+1:]...)
+							w.WriteHeader(http.StatusAccepted)
+						default:
+							http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+						}
+						return
+					}
 				}
+				http.NotFound(w, r)
+				return
+			}
+
+			if r.Method == http.MethodGet {
+				list := []interface{}{}
+				for _, kp := range keypairs {
+					list = append(list, map[string]interface{}{"keypair": kp})
+				}
+				writeJSON(w, map[string]interface{}{"keypairs": list})
 				return
 			}
 			if r.Method == http.MethodPost {
@@ -748,17 +881,14 @@ func RegisterNovaHandlers(mux *http.ServeMux) {
 					return
 				}
 				kp := req.Keypair
-				kp["fingerprint"] = "fake:fingerprint"
-				kp["created_at"] = "2026-01-01T00:00:00Z"
-				keypairs = append(keypairs, map[string]interface{}{"keypair": kp})
+				enrichKeypair(kp, ProjectIDFromToken(r))
+				keypairs = append(keypairs, kp)
 				w.WriteHeader(http.StatusCreated)
-				err := json.NewEncoder(w).Encode(map[string]interface{}{"keypair": kp})
-				if err != nil {
-					log.Printf("Error encoding JSON response: %v", err)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				}
+				writeJSON(w, map[string]interface{}{"keypair": kp})
 				return
 			}
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
 		http.NotFound(w, r)
 	})
