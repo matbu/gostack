@@ -1,14 +1,9 @@
 name: VMK integration tests
 
 # Runs the vmware-migration-kit (VMK) integration suite against the gostack build
-# from THIS pull request, so a gostack change that would break VMK's current use
-# of the fake OpenStack API is caught before merge.
 #
 # VMK drives gostack via tests/integration/scripts/prelude.sh, which clones and
-# starts gostack from its main branch -- UNLESS a fake server is already running
-# (it checks the PID file and exits early). We exploit that: we build and start
-# THIS PR's gostack on the default port/PID first, so `make integration-test`
-# reuses it and the VMK tests exercise the PR's code.
+# starts gostack from its main branch.
 
 on:
   push:
