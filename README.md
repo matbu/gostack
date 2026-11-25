@@ -19,8 +19,28 @@ make build && ./bin/fake-openstack
 - `--pid-file` (default: /tmp/fake_os_server.pid)
 - `--log-level` (debug, info, warn, error)
 - `--base-url` (default: http://bind:port)
+- `--seed` (default: osmigrate) — which sample resources to start with
+- `--allow-anonymous` (default: false) — serve requests that carry no token
+  instead of answering 401
 
 Environment: `GOSTACK_PORT`, `GOSTACK_BIND`, etc.
+
+### Seed profiles
+
+- `osmigrate` (default): the fixtures os-migrate's export tests read — a
+  volume, an SR-IOV port, the `private`/`public` networks. Listings are
+  scoped to the token's project.
+- `devstack`: what a freshly stacked devstack has — a cirros image, the
+  `private`/`public`/`shared` networks with subnets, a default security
+  group, and nothing else. Listings span all projects, matching the admin
+  role the token carries. Use this for clients written against a real cloud.
+
+## API conformance
+
+[`docs/api-conformance.md`](docs/api-conformance.md) records how closely
+gostack follows the real APIs, which services it covers, what is missing,
+and how to re-measure it against the upstream
+`ansible-collections-openstack` functional test suite.
 
 ### As a Go package
 

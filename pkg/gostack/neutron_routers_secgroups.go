@@ -19,7 +19,7 @@ package gostack
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+
 	"net/http"
 	"strings"
 	"time"
@@ -70,6 +70,19 @@ func enrichSecGroup(sg map[string]interface{}, projectID string) {
 	}
 }
 
+// normalizeCIDR gives a bare address the prefix length Neutron adds when it
+// stores a remote_ip_prefix: /32 for IPv4 and /128 for IPv6.
+func normalizeCIDR(v interface{}) interface{} {
+	addr, ok := v.(string)
+	if !ok || addr == "" || strings.Contains(addr, "/") {
+		return v
+	}
+	if strings.Contains(addr, ":") {
+		return addr + "/128"
+	}
+	return addr + "/32"
+}
+
 func enrichSecGroupRule(ru map[string]interface{}, projectID string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	setDefault(ru, "description", nil)
@@ -89,6 +102,7 @@ func enrichSecGroupRule(ru map[string]interface{}, projectID string) {
 	}
 	ru["ether_type"] = ru["ethertype"]
 	setDefault(ru, "direction", "ingress")
+	ru["remote_ip_prefix"] = normalizeCIDR(ru["remote_ip_prefix"])
 	if projectID != "" {
 		setDefault(ru, "project_id", projectID)
 		setDefault(ru, "tenant_id", ru["project_id"])
@@ -150,38 +164,40 @@ func registerNeutronRouters(mux *http.ServeMux) {
 
 		switch r.Method {
 		case http.MethodGet:
-			nameFilter := r.URL.Query().Get("name")
-			filtered := []map[string]interface{}{}
+			anyProject := ShowAllProjects(r.URL.Query())
+			visible := []map[string]interface{}{}
 			for _, rt := range routers {
 				enrichRouter(rt, projectID)
-				if rt["project_id"] != projectID {
+				if !anyProject && rt["project_id"] != projectID {
 					continue
 				}
-				if nameFilter != "" {
-					if n, ok := rt["name"].(string); !ok || n != nameFilter {
-						continue
-					}
-				}
-				filtered = append(filtered, rt)
+				visible = append(visible, rt)
 			}
-			writeJSON(w, map[string]interface{}{"routers": filtered})
+			writeJSON(w, map[string]interface{}{
+				"routers": ApplyLimit(FilterList(visible, r.URL.Query(), "external_gateway_info"), r.URL.Query()),
+			})
 		case http.MethodPost:
 			var req struct {
 				Router map[string]interface{} `json:"router"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				badRequest(w, Neutron, "Invalid request body: "+err.Error())
 				return
 			}
 			rt := req.Router
+			if rt == nil {
+				badRequest(w, Neutron, "Expecting to find router in request body.")
+				return
+			}
 			routerSeq++
 			rt["id"] = fmt.Sprintf("router-%d", routerSeq)
 			enrichRouter(rt, projectID)
+			fillExternalGateway(rt)
 			routers = append(routers, rt)
 			w.WriteHeader(http.StatusCreated)
 			writeJSON(w, map[string]interface{}{"router": rt})
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Neutron, r.Method)
 		}
 	})
 
@@ -194,7 +210,7 @@ func registerNeutronRouters(mux *http.ServeMux) {
 
 		parts := Parts(r.URL.Path) // ["v2.0","routers","{id}", maybe "add_router_interface"]
 		if len(parts) < 3 {
-			http.NotFound(w, r)
+			notFound(w, Neutron, "Router")
 			return
 		}
 		id := parts[2]
@@ -207,7 +223,7 @@ func registerNeutronRouters(mux *http.ServeMux) {
 			}
 		}
 		if idx == -1 {
-			http.NotFound(w, r)
+			notFound(w, Neutron, "Router "+id)
 			return
 		}
 		rt := routers[idx]
@@ -248,9 +264,13 @@ func registerNeutronRouters(mux *http.ServeMux) {
 				} else {
 					// Attach by subnet_id: create the router port.
 					portID = fmt.Sprintf("port-%d", len(ports)+1)
+					gatewayIP := "10.0.0.1"
 					for _, s := range subnets {
 						if s["id"] == subnetID {
 							networkID, _ = s["network_id"].(string)
+							if gw, ok := s["gateway_ip"].(string); ok && gw != "" {
+								gatewayIP = gw
+							}
 						}
 					}
 					port := map[string]interface{}{
@@ -260,8 +280,11 @@ func registerNeutronRouters(mux *http.ServeMux) {
 						"device_owner": "network:router_interface",
 						"project_id":   projectID,
 						"status":       "ACTIVE",
-						"fixed_ips":    []map[string]interface{}{{"subnet_id": subnetID, "ip_address": "10.0.0.1"}},
+						"fixed_ips": []interface{}{map[string]interface{}{
+							"subnet_id": subnetID, "ip_address": gatewayIP,
+						}},
 					}
+					enrichPort(port, projectID)
 					ports = append(ports, port)
 				}
 				writeJSON(w, map[string]interface{}{
@@ -299,7 +322,7 @@ func registerNeutronRouters(mux *http.ServeMux) {
 				})
 				return
 			}
-			http.NotFound(w, r)
+			notFound(w, Neutron, "Router action "+action)
 			return
 		}
 
@@ -311,22 +334,26 @@ func registerNeutronRouters(mux *http.ServeMux) {
 				Router map[string]interface{} `json:"router"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				badRequest(w, Neutron, "Invalid request body: "+err.Error())
 				return
 			}
+			// Keep the gateway addresses already allocated: re-running an
+			// update that does not name them must not hand out new ones,
+			// which clients see as a spurious change.
+			previousGateway, _ := rt["external_gateway_info"].(map[string]interface{})
 			for k, v := range req.Router {
 				rt[k] = v
 			}
-			if rev, ok := rt["revision_number"].(int); ok {
-				rt["revision_number"] = rev + 1
-			}
+			carryOverGatewayIPs(rt, previousGateway)
+			fillExternalGateway(rt)
+			bumpRevision(rt)
 			routers[idx] = rt
 			writeJSON(w, map[string]interface{}{"router": rt})
 		case http.MethodDelete:
 			routers = append(routers[:idx], routers[idx+1:]...)
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Neutron, r.Method)
 		}
 	})
 }
@@ -341,41 +368,44 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 
 		switch r.Method {
 		case http.MethodGet:
-			nameFilter := r.URL.Query().Get("name")
-			filtered := []map[string]interface{}{}
+			anyProject := ShowAllProjects(r.URL.Query())
+			visible := []map[string]interface{}{}
 			for _, sg := range neutronSecGroups {
 				enrichSecGroup(sg, projectID)
-				if sg["project_id"] != projectID {
+				if !anyProject && sg["project_id"] != projectID {
 					continue
-				}
-				if nameFilter != "" {
-					if n, ok := sg["name"].(string); !ok || n != nameFilter {
-						continue
-					}
 				}
 				// Like Neutron, embed each group's rules in the list response
 				// too (clients such as os-migrate read them from here).
 				sg["security_group_rules"] = secGroupRulesFor(sg["id"])
-				filtered = append(filtered, sg)
+				visible = append(visible, sg)
 			}
-			writeJSON(w, map[string]interface{}{"security_groups": filtered})
+			writeJSON(w, map[string]interface{}{
+				"security_groups": ApplyLimit(FilterList(visible, r.URL.Query(), "security_group_rules"), r.URL.Query()),
+			})
 		case http.MethodPost:
 			var req struct {
 				SecurityGroup map[string]interface{} `json:"security_group"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				badRequest(w, Neutron, "Invalid request body: "+err.Error())
 				return
 			}
 			sg := req.SecurityGroup
+			if sg == nil {
+				badRequest(w, Neutron, "Expecting to find security_group in request body.")
+				return
+			}
 			secGroupSeq++
 			sg["id"] = fmt.Sprintf("sg-%d", secGroupSeq)
 			enrichSecGroup(sg, projectID)
+			addDefaultSecGroupRules(sg, projectID)
+			sg["security_group_rules"] = secGroupRulesFor(sg["id"])
 			neutronSecGroups = append(neutronSecGroups, sg)
 			w.WriteHeader(http.StatusCreated)
 			writeJSON(w, map[string]interface{}{"security_group": sg})
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Neutron, r.Method)
 		}
 	})
 
@@ -395,7 +425,7 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 			}
 		}
 		if idx == -1 {
-			http.NotFound(w, r)
+			notFound(w, Neutron, "Security group "+id)
 			return
 		}
 		sg := neutronSecGroups[idx]
@@ -414,7 +444,7 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 				SecurityGroup map[string]interface{} `json:"security_group"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				badRequest(w, Neutron, "Invalid request body: "+err.Error())
 				return
 			}
 			for k, v := range req.SecurityGroup {
@@ -424,9 +454,16 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 			writeJSON(w, map[string]interface{}{"security_group": sg})
 		case http.MethodDelete:
 			neutronSecGroups = append(neutronSecGroups[:idx], neutronSecGroups[idx+1:]...)
+			remaining := []map[string]interface{}{}
+			for _, ru := range neutronSecGroupRules {
+				if ru["security_group_id"] != id {
+					remaining = append(remaining, ru)
+				}
+			}
+			neutronSecGroupRules = remaining
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Neutron, r.Method)
 		}
 	})
 
@@ -439,25 +476,55 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 
 		switch r.Method {
 		case http.MethodGet:
-			sgFilter := r.URL.Query().Get("security_group_id")
-			filtered := []map[string]interface{}{}
+			visible := []map[string]interface{}{}
 			for _, ru := range neutronSecGroupRules {
 				enrichSecGroupRule(ru, projectID)
-				if sgFilter != "" && ru["security_group_id"] != sgFilter {
-					continue
-				}
-				filtered = append(filtered, ru)
+				visible = append(visible, ru)
 			}
-			writeJSON(w, map[string]interface{}{"security_group_rules": filtered})
+			writeJSON(w, map[string]interface{}{
+				"security_group_rules": ApplyLimit(FilterList(visible, r.URL.Query()), r.URL.Query()),
+			})
 		case http.MethodPost:
 			var req struct {
-				SecurityGroupRule map[string]interface{} `json:"security_group_rule"`
+				SecurityGroupRule  map[string]interface{}   `json:"security_group_rule"`
+				SecurityGroupRules []map[string]interface{} `json:"security_group_rules"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				badRequest(w, Neutron, "Invalid request body: "+err.Error())
+				return
+			}
+			// Neutron also accepts a bulk create, which openstacksdk uses
+			// whenever a client asks for more than one rule at a time.
+			if req.SecurityGroupRule == nil && req.SecurityGroupRules != nil {
+				created := []map[string]interface{}{}
+				for _, ru := range req.SecurityGroupRules {
+					if ru == nil {
+						continue
+					}
+					enrichSecGroupRule(ru, projectID)
+					if dup := findDuplicateSecGroupRule(ru); dup != nil {
+						writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+							"NeutronError": map[string]interface{}{
+								"type":    "SecurityGroupRuleExists",
+								"message": fmt.Sprintf("Security group rule already exists. Rule id is %v.", dup["id"]),
+								"detail":  "",
+							}})
+						return
+					}
+					secGroupRuleSeq++
+					ru["id"] = fmt.Sprintf("sgr-%d", secGroupRuleSeq)
+					neutronSecGroupRules = append(neutronSecGroupRules, ru)
+					created = append(created, ru)
+				}
+				writeJSONStatus(w, http.StatusCreated,
+					map[string]interface{}{"security_group_rules": created})
 				return
 			}
 			ru := req.SecurityGroupRule
+			if ru == nil {
+				badRequest(w, Neutron, "Expecting to find security_group_rule in request body.")
+				return
+			}
 			enrichSecGroupRule(ru, projectID)
 			// Neutron rejects a rule identical to an existing one with a 409
 			// (SecurityGroupRuleExists); os-migrate relies on that to make
@@ -477,7 +544,7 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 			w.WriteHeader(http.StatusCreated)
 			writeJSON(w, map[string]interface{}{"security_group_rule": ru})
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Neutron, r.Method)
 		}
 	})
 
@@ -499,12 +566,12 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 					neutronSecGroupRules = append(neutronSecGroupRules[:i], neutronSecGroupRules[i+1:]...)
 					w.WriteHeader(http.StatusNoContent)
 				default:
-					http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+					methodNotAllowed(w, Neutron, r.Method)
 				}
 				return
 			}
 		}
-		http.NotFound(w, r)
+		notFound(w, Neutron, "Security group rule "+id)
 	})
 }
 
@@ -550,7 +617,7 @@ func handleTags(w http.ResponseWriter, r *http.Request, parts []string, obj map[
 			obj["tags"] = []string{}
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Neutron, r.Method)
 		}
 		return true
 	}
@@ -565,7 +632,7 @@ func handleTags(w http.ResponseWriter, r *http.Request, parts []string, obj map[
 				return true
 			}
 		}
-		http.NotFound(w, r)
+		notFound(w, Neutron, "Tag "+tag)
 	case http.MethodPut:
 		found := false
 		for _, t := range tags {
@@ -588,15 +655,136 @@ func handleTags(w http.ResponseWriter, r *http.Request, parts []string, obj map[
 		obj["tags"] = out
 		w.WriteHeader(http.StatusNoContent)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		methodNotAllowed(w, Neutron, r.Method)
 	}
 	return true
 }
 
-// writeJSON encodes v as a JSON response, logging on failure.
-func writeJSON(w http.ResponseWriter, v interface{}) {
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("Error encoding JSON response: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+// addDefaultSecGroupRules creates the two egress rules Neutron adds to every
+// new security group, one per address family. The caller must hold the mutex.
+func addDefaultSecGroupRules(sg map[string]interface{}, projectID string) {
+	for _, ethertype := range []string{"IPv4", "IPv6"} {
+		secGroupRuleSeq++
+		ru := map[string]interface{}{
+			"id":                fmt.Sprintf("sgr-%d", secGroupRuleSeq),
+			"security_group_id": sg["id"],
+			"direction":         "egress",
+			"ethertype":         ethertype,
+		}
+		enrichSecGroupRule(ru, projectID)
+		neutronSecGroupRules = append(neutronSecGroupRules, ru)
+	}
+}
+
+// fillExternalGateway completes a router's external_gateway_info the way
+// Neutron does: attaching a gateway network allocates a fixed IP on one of
+// its subnets, and clients read the subnet back from external_fixed_ips.
+// The caller must hold the state mutex.
+func fillExternalGateway(rt map[string]interface{}) {
+	gw, ok := rt["external_gateway_info"].(map[string]interface{})
+	if !ok || gw == nil {
+		return
+	}
+	netID, _ := gw["network_id"].(string)
+	if netID == "" {
+		return
+	}
+	setDefault(gw, "enable_snat", true)
+	fixed, _ := gw["external_fixed_ips"].([]interface{})
+	if len(fixed) > 0 {
+		for _, raw := range fixed {
+			entry, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			// An entry may name only an address, or only a subnet;
+			// Neutron completes whichever half is missing.
+			if sid, ok := entry["subnet_id"].(string); !ok || sid == "" {
+				if sub := firstSubnetOf(netID); sub != "" {
+					entry["subnet_id"] = sub
+				}
+			}
+			if addr, ok := entry["ip_address"].(string); !ok || addr == "" {
+				entry["ip_address"] = allocateExternalIP()
+			}
+		}
+		rt["external_gateway_info"] = gw
+		return
+	}
+	sub := firstSubnetOf(netID)
+	if sub == "" {
+		return
+	}
+	gw["external_fixed_ips"] = []interface{}{map[string]interface{}{
+		"subnet_id": sub, "ip_address": allocateExternalIP(),
+	}}
+	rt["external_gateway_info"] = gw
+}
+
+// externalIPSeq numbers the addresses handed out on external networks.
+var externalIPSeq = 0
+
+// allocateExternalIP returns the next gateway address on the external net.
+func allocateExternalIP() string {
+	externalIPSeq++
+	return fmt.Sprintf("172.24.4.%d", 100+externalIPSeq)
+}
+
+// firstSubnetOf returns the id of a network's first subnet, or "".
+// The caller must hold the state mutex.
+func firstSubnetOf(networkID string) string {
+	for _, s := range subnets {
+		if s["network_id"] == networkID {
+			id, _ := s["id"].(string)
+			return id
+		}
+	}
+	return ""
+}
+
+// carryOverGatewayIPs keeps a router's previously allocated external fixed
+// IPs when an update re-states the same gateway network without naming
+// them. Neutron does not reallocate in that case.
+// The caller must hold the state mutex.
+func carryOverGatewayIPs(rt map[string]interface{}, previous map[string]interface{}) {
+	if previous == nil {
+		return
+	}
+	gw, ok := rt["external_gateway_info"].(map[string]interface{})
+	if !ok || gw == nil {
+		return
+	}
+	if gw["network_id"] != previous["network_id"] {
+		return
+	}
+	prior, _ := previous["external_fixed_ips"].([]interface{})
+	if len(prior) == 0 {
+		return
+	}
+	current, _ := gw["external_fixed_ips"].([]interface{})
+	if len(current) == 0 {
+		gw["external_fixed_ips"] = prior
+		return
+	}
+	// The update may name only the subnet; reuse the address already
+	// allocated on it rather than taking a fresh one.
+	for _, raw := range current {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if addr, ok := entry["ip_address"].(string); ok && addr != "" {
+			continue
+		}
+		for _, rawPrior := range prior {
+			priorEntry, ok := rawPrior.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if priorEntry["subnet_id"] == entry["subnet_id"] {
+				entry["ip_address"] = priorEntry["ip_address"]
+				break
+			}
+		}
 	}
 }

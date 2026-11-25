@@ -33,6 +33,13 @@ type Options struct {
 	PIDFile string
 	// BaseURL is the base URL for catalog/links (e.g. "http://127.0.0.1:5000").
 	BaseURL string
+	// AllowAnonymous serves requests that carry no X-Auth-Token. The real
+	// services answer those with a 401; leave this false unless a client
+	// cannot authenticate.
+	AllowAnonymous bool
+	// SeedProfile selects the sample resources the cloud starts with:
+	// SeedOSMigrate (the default) or SeedDevstack.
+	SeedProfile string
 }
 
 // DefaultOptions returns default server options.
@@ -76,20 +83,24 @@ func NewFakeServer(opts Options) *FakeServer {
 
 	SetBaseURL(opts.BaseURL)
 
+	if opts.SeedProfile != "" {
+		ApplySeedProfile(opts.SeedProfile)
+	}
+
 	pid := os.Getpid()
 	if err := os.WriteFile(opts.PIDFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
 		log.Fatalf("Failed to write PID file: %v", err)
 	}
 
-	roleAssignments := map[string]map[string][]string{}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.Path)
-		http.NotFound(w, r)
+		log.Printf("unrouted %s %s", r.Method, r.URL.Path)
+		notFound(w, serviceForPath(r.URL.Path), "The resource")
 	})
 
-	RegisterKeystoneHandlers(mux, roleAssignments)
+	RegisterKeystoneHandlers(mux)
+	RegisterKeystoneExtraHandlers(mux)
 	RegisterNovaHandlers(mux)
 	RegisterNeutronHandlers(mux)
 	RegisterCinderHandlers(mux)
@@ -98,9 +109,16 @@ func NewFakeServer(opts Options) *FakeServer {
 	addr := fmt.Sprintf("%s:%d", opts.BindAddr, opts.Port)
 	fs := &FakeServer{URL: "http://" + addr, PIDFile: opts.PIDFile}
 
+	var handler http.Handler = mux
+	handler = Microversion(handler)
+	if !opts.AllowAnonymous {
+		handler = RequireToken(handler)
+	}
+	handler = Recover(NormalizeV2Path(handler))
+
 	go func() {
 		log.Printf("Fake OpenStack API listening on %s", addr)
-		err := http.ListenAndServe(addr, Recover(NormalizeV2Path(mux)))
+		err := http.ListenAndServe(addr, handler)
 		if err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}

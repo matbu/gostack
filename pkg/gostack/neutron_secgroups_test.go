@@ -107,9 +107,31 @@ func TestSecGroupListEmbedsRules(t *testing.T) {
 		sg := g.(map[string]interface{})
 		rulesByGroup[sg["id"].(string)] = sg["security_group_rules"].([]interface{})
 	}
-	require.Len(t, rulesByGroup[sgID], 1)
-	assert.Equal(t, "tcp", rulesByGroup[sgID][0].(map[string]interface{})["protocol"])
-	assert.Empty(t, rulesByGroup[otherID])
+	// Neutron gives every new group a default egress rule per address
+	// family, so the explicit rule is the third one here and a group with
+	// no explicit rules still has two.
+	require.Len(t, rulesByGroup[sgID], 3)
+	assert.Equal(t, "tcp", ruleWithProtocol(t, rulesByGroup[sgID], "tcp")["protocol"])
+	assert.Len(t, rulesByGroup[otherID], 2)
+	for _, raw := range rulesByGroup[otherID] {
+		assert.Equal(t, "egress", raw.(map[string]interface{})["direction"])
+	}
+}
+
+// ruleWithProtocol returns the single rule in rules using the given
+// protocol, failing the test when there is not exactly one.
+func ruleWithProtocol(t *testing.T, rules []interface{}, protocol string) map[string]interface{} {
+	t.Helper()
+	var found map[string]interface{}
+	for _, raw := range rules {
+		rule := raw.(map[string]interface{})
+		if rule["protocol"] == protocol {
+			require.Nil(t, found, "more than one %s rule", protocol)
+			found = rule
+		}
+	}
+	require.NotNil(t, found, "no %s rule found", protocol)
+	return found
 }
 
 func TestSecGroupRuleDuplicateConflict(t *testing.T) {
@@ -147,6 +169,8 @@ func TestSecGroupRuleDuplicateConflict(t *testing.T) {
 	assert.Equal(t, "IPv6", rule["ethertype"])
 	assert.Equal(t, "IPv6", rule["ether_type"])
 
+	// Three explicit rules plus the two default egress rules the group was
+	// created with.
 	rules := getJSON(t, rulesURL+"?security_group_id="+sgID)["security_group_rules"].([]interface{})
-	assert.Len(t, rules, 3)
+	assert.Len(t, rules, 5)
 }

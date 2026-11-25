@@ -24,29 +24,46 @@ import (
 )
 
 // RegisterKeystoneHandlers registers Keystone API handlers on mux.
-func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map[string][]string) {
+func RegisterKeystoneHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/v3", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.String())
-		log.Printf("%s %s", r.URL.Path, r.URL.RawQuery)
-		err := json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, map[string]interface{}{
 			"version": map[string]interface{}{
-				"id":     "v3.14",
-				"status": "stable",
+				"id":      "v3.14",
+				"status":  "stable",
+				"updated": "2023-01-01T00:00:00Z",
 				"links": []map[string]string{
 					{"rel": "self", "href": baseURL + "/v3/"},
 				},
+				"media-types": []map[string]string{
+					{"base": "application/json", "type": "application/vnd.openstack.identity-v3+json"},
+				},
 			},
 		})
-		if err != nil {
-			log.Printf("Error encoding JSON response: %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
 	})
 
 	mux.HandleFunc("/v3/auth/tokens", func(w http.ResponseWriter, r *http.Request) {
-		projectID := "source"
-		projectName := "source"
+		// GET and HEAD validate the token in X-Subject-Token rather than
+		// issuing a new one; DELETE revokes it.
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			validateToken(w, r)
+			return
+		case http.MethodDelete:
+			subject := r.Header.Get("X-Subject-Token")
+			tokenMu.Lock()
+			delete(tokenProjects, subject)
+			tokenMu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case http.MethodPost:
+			// fall through to issue a token
+		default:
+			methodNotAllowed(w, Keystone, r.Method)
+			return
+		}
+
+		var askedID, askedName string
 		if r.Body != nil {
 			var authReq struct {
 				Auth struct {
@@ -59,105 +76,19 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 				} `json:"auth"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&authReq); err == nil {
-				if authReq.Auth.Scope.Project.ID != "" {
-					projectID = authReq.Auth.Scope.Project.ID
-				}
-				if authReq.Auth.Scope.Project.Name != "" {
-					projectName = authReq.Auth.Scope.Project.Name
-				}
+				askedID = authReq.Auth.Scope.Project.ID
+				askedName = authReq.Auth.Scope.Project.Name
 			}
 		}
-		if p, ok := projects[projectID]; ok {
-			projectID = p.ID
-			projectName = p.Name
-		} else if p, ok := projects[projectName]; ok {
-			projectID = p.ID
-			projectName = p.Name
-		} else {
-			for _, p := range projects {
-				if p.Name == projectName {
-					projectID = p.ID
-					projectName = p.Name
-					break
-				}
-			}
-		}
+		projectID, projectName := resolveScope(askedID, askedName)
 		token := "fake-token-" + projectID
 		w.Header().Set("X-Subject-Token", token)
 		tokenMu.Lock()
 		tokenProjects[token] = projectID
 		tokenMu.Unlock()
-		w.WriteHeader(http.StatusCreated)
-		catalog := []map[string]interface{}{
-			{
-				"type": "identity",
-				"name": "keystone",
-				"endpoints": []map[string]interface{}{
-					{
-						"id": "keystone-public", "interface": "public",
-						"region": "RegionOne", "region_id": "RegionOne",
-						"url": baseURL + "/v3/",
-					},
-				},
-			},
-			{
-				"type": "compute",
-				"name": "nova",
-				"endpoints": []map[string]interface{}{
-					{
-						"id": "nova-public", "interface": "public",
-						"region": "RegionOne", "region_id": "RegionOne",
-						"url": baseURL + "/v2.1/" + projectID,
-					},
-				},
-			},
-			{
-				"type": "network",
-				"name": "neutron",
-				"endpoints": []map[string]interface{}{
-					{
-						"id": "neutron-public", "interface": "public",
-						"region": "RegionOne", "region_id": "RegionOne",
-						"url": baseURL + "/v2.0",
-					},
-				},
-			},
-			{
-				"type": "image",
-				"name": "glance",
-				"endpoints": []map[string]interface{}{
-					{
-						"id": "glance-public", "interface": "public",
-						"region": "RegionOne", "region_id": "RegionOne",
-						"url": baseURL + "/v2",
-					},
-				},
-			},
-			{
-				"type": "volumev3",
-				"name": "cinder",
-				"endpoints": []map[string]interface{}{
-					{
-						"id": "cinder-public", "interface": "public",
-						"region": "RegionOne", "region_id": "RegionOne",
-						"url": baseURL + "/v3/" + projectID,
-					},
-				},
-			},
-		}
-		err := json.NewEncoder(w).Encode(map[string]interface{}{
-			"token": map[string]interface{}{
-				"expires_at": "2099-01-01T00:00:00.000000Z",
-				"issued_at":  "2026-01-01T00:00:00.000000Z",
-				"project": map[string]string{"id": projectID, "name": projectName},
-				"user": map[string]string{"id": "demo-user", "name": "demo"},
-				"catalog": catalog,
-			},
-		})
-		if err != nil {
-			log.Printf("Error encoding JSON response: %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
+		catalog := catalogFor(projectID)
+		writeJSONStatus(w, http.StatusCreated,
+			map[string]interface{}{"token": tokenDocument(projectID, projectName, catalog)})
 	})
 
 	mux.HandleFunc("/v3/domains", func(w http.ResponseWriter, r *http.Request) {
@@ -165,15 +96,8 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 		defer mu.Unlock()
 		log.Printf("%s %s", r.Method, r.URL.String())
 		if r.Method == http.MethodGet {
-			nameFilter := r.URL.Query().Get("name")
-			list := []interface{}{}
-			for _, d := range domains {
-				if nameFilter != "" && d.Name != nameFilter {
-					continue
-				}
-				list = append(list, d)
-			}
-			writeJSON(w, map[string]interface{}{"domains": list})
+			list := AsList(domains, func(d *Domain) map[string]interface{} { return d.toMap(baseURL) })
+			writeJSON(w, map[string]interface{}{"domains": FilterList(list, r.URL.Query())})
 			return
 		}
 		if r.Method == http.MethodPost {
@@ -185,7 +109,7 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 				} `json:"domain"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid JSON body", http.StatusBadRequest)
+				badRequest(w, Keystone, "Invalid request body.")
 				return
 			}
 			id := RandomID("domain")
@@ -198,26 +122,31 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 				name = id
 			}
 			domains[id] = &Domain{ID: id, Name: name, Description: req.Domain.Description, Enabled: enabled}
-			w.WriteHeader(http.StatusCreated)
-			writeJSON(w, map[string]interface{}{"domain": domains[id]})
+			writeJSONStatus(w, http.StatusCreated,
+				map[string]interface{}{"domain": domains[id].toMap(baseURL)})
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		methodNotAllowed(w, Keystone, r.Method)
 	})
 
 	mux.HandleFunc("/v3/domains/", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		log.Printf("%s %s", r.Method, r.URL.String())
-		id := Parts(r.URL.Path)[2]
+		pathParts := Parts(r.URL.Path)
+		// Grants: /v3/domains/{dom}/{users|groups}/{id}/roles[/{role}]
+		if serveRoleGrants(w, r, pathParts) {
+			return
+		}
+		id := pathParts[2]
 		d, ok := domains[id]
 		if !ok {
-			http.NotFound(w, r)
+			notFound(w, Keystone, "Could not find domain: "+id+".")
 			return
 		}
 		switch r.Method {
 		case http.MethodGet:
-			writeJSON(w, map[string]interface{}{"domain": d})
+			writeJSON(w, map[string]interface{}{"domain": d.toMap(baseURL)})
 		case http.MethodPatch:
 			var req struct {
 				Domain struct {
@@ -227,7 +156,7 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 				} `json:"domain"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid JSON body", http.StatusBadRequest)
+				badRequest(w, Keystone, "Invalid request body.")
 				return
 			}
 			if req.Domain.Name != nil {
@@ -239,12 +168,18 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 			if req.Domain.Enabled != nil {
 				d.Enabled = *req.Domain.Enabled
 			}
-			writeJSON(w, map[string]interface{}{"domain": d})
+			writeJSON(w, map[string]interface{}{"domain": d.toMap(baseURL)})
 		case http.MethodDelete:
+			// Keystone refuses to delete a domain that is still enabled.
+			if d.Enabled {
+				apiError(w, Keystone, http.StatusForbidden,
+					"Cannot delete a domain that is enabled, please disable it first.")
+				return
+			}
 			delete(domains, id)
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Keystone, r.Method)
 		}
 	})
 
@@ -253,15 +188,8 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 		defer mu.Unlock()
 		log.Printf("%s %s", r.Method, r.URL.String())
 		if r.Method == http.MethodGet {
-			name := r.URL.Query().Get("name")
-			list := []interface{}{}
-			for _, p := range projects {
-				if name != "" && p.Name != name {
-					continue
-				}
-				list = append(list, p.toMap())
-			}
-			writeJSON(w, map[string]interface{}{"projects": list})
+			list := AsList(projects, func(p *Project) map[string]interface{} { return p.toMap() })
+			writeJSON(w, map[string]interface{}{"projects": FilterList(list, r.URL.Query())})
 			return
 		}
 		if r.Method == http.MethodPost {
@@ -274,11 +202,11 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 				} `json:"project"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid JSON body", http.StatusBadRequest)
+				badRequest(w, Keystone, "Invalid request body.")
 				return
 			}
 			if req.Project.Name == "" {
-				http.Error(w, "Missing project name", http.StatusBadRequest)
+				badRequest(w, Keystone, "Expecting to find name in project.")
 				return
 			}
 			domainID := req.Project.DomainID
@@ -294,10 +222,10 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 				Description: req.Project.Description, Enabled: enabled}
 			projects[id] = p
 			w.WriteHeader(http.StatusCreated)
-			writeJSON(w, map[string]interface{}{"project": p})
+			writeJSON(w, map[string]interface{}{"project": p.toMap()})
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		methodNotAllowed(w, Keystone, r.Method)
 	})
 
 	mux.HandleFunc("/v3/projects/", func(w http.ResponseWriter, r *http.Request) {
@@ -320,7 +248,7 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 					} `json:"project"`
 				}
 				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-					http.Error(w, "invalid JSON body", http.StatusBadRequest)
+					badRequest(w, Keystone, "Invalid request body.")
 					return
 				}
 				id := RandomID("project")
@@ -336,80 +264,20 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 					Description: req.Project.Description, Enabled: enabled}
 				projects[id] = p
 				w.WriteHeader(http.StatusCreated)
-				writeJSON(w, map[string]interface{}{"project": p})
+				writeJSON(w, map[string]interface{}{"project": p.toMap()})
 				return
 			}
 			if r.Method == http.MethodGet {
-				name := r.URL.Query().Get("name")
-				list := []interface{}{}
-				for _, p := range projects {
-					if name != "" && p.Name != name {
-						continue
-					}
-					list = append(list, p.toMap())
-				}
-				writeJSON(w, map[string]interface{}{"projects": list})
+				list := AsList(projects, func(p *Project) map[string]interface{} { return p.toMap() })
+				writeJSON(w, map[string]interface{}{"projects": FilterList(list, r.URL.Query())})
 				return
 			}
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Keystone, r.Method)
 			return
 		}
 
-		// GET /v3/projects/{proj}/users/{user}/roles
-		if len(pathParts) == 6 && pathParts[3] == "users" && pathParts[5] == "roles" && r.Method == http.MethodGet {
-			projectID := pathParts[2]
-			userID := pathParts[4]
-			userRoles := []map[string]string{}
-			if projMap, ok := roleAssignments[projectID]; ok {
-				if roleIDs, ok := projMap[userID]; ok {
-					for _, roleID := range roleIDs {
-						if role, ok := roles[roleID]; ok {
-							userRoles = append(userRoles, map[string]string{"id": role.ID, "name": role.Name})
-						}
-					}
-				}
-			}
-			writeJSON(w, map[string]interface{}{"roles": userRoles})
-			return
-		}
-		// PUT/HEAD/GET/DELETE /v3/projects/{proj}/users/{user}/roles/{role}
-		if len(pathParts) == 7 && pathParts[3] == "users" && pathParts[5] == "roles" {
-			projectID := pathParts[2]
-			userID := pathParts[4]
-			roleID := pathParts[6]
-			assigned := false
-			for _, rid := range roleAssignments[projectID][userID] {
-				if rid == roleID {
-					assigned = true
-				}
-			}
-			switch r.Method {
-			case http.MethodPut:
-				if _, ok := roleAssignments[projectID]; !ok {
-					roleAssignments[projectID] = map[string][]string{}
-				}
-				if !assigned {
-					roleAssignments[projectID][userID] = append(roleAssignments[projectID][userID], roleID)
-				}
-				w.WriteHeader(http.StatusNoContent)
-			case http.MethodHead, http.MethodGet:
-				if assigned {
-					w.WriteHeader(http.StatusNoContent)
-				} else {
-					http.NotFound(w, r)
-				}
-			case http.MethodDelete:
-				out := []string{}
-				for _, rid := range roleAssignments[projectID][userID] {
-					if rid != roleID {
-						out = append(out, rid)
-					}
-				}
-				roleAssignments[projectID][userID] = out
-				w.WriteHeader(http.StatusNoContent)
-			default:
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			}
+		// Grants: /v3/projects/{proj}/{users|groups}/{id}/roles[/{role}]
+		if serveRoleGrants(w, r, pathParts) {
 			return
 		}
 		// GET/PATCH/DELETE /v3/projects/{proj}
@@ -417,12 +285,12 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 			projectID := pathParts[2]
 			p, ok := projects[projectID]
 			if !ok {
-				http.NotFound(w, r)
+				notFound(w, Keystone, "Could not find project: "+projectID+".")
 				return
 			}
 			switch r.Method {
 			case http.MethodGet:
-				writeJSON(w, map[string]interface{}{"project": p})
+				writeJSON(w, map[string]interface{}{"project": p.toMap()})
 			case http.MethodPatch:
 				var req struct {
 					Project struct {
@@ -432,7 +300,7 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 					} `json:"project"`
 				}
 				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-					http.Error(w, "invalid JSON body", http.StatusBadRequest)
+					badRequest(w, Keystone, "Invalid request body.")
 					return
 				}
 				if req.Project.Name != nil {
@@ -444,65 +312,54 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 				if req.Project.Enabled != nil {
 					p.Enabled = *req.Project.Enabled
 				}
-				writeJSON(w, map[string]interface{}{"project": p})
+				writeJSON(w, map[string]interface{}{"project": p.toMap()})
 			case http.MethodDelete:
 				delete(projects, projectID)
 				w.WriteHeader(http.StatusNoContent)
 			default:
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				methodNotAllowed(w, Keystone, r.Method)
 			}
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		methodNotAllowed(w, Keystone, r.Method)
 	})
 
 	mux.HandleFunc("/v3/roles", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.String())
+		mu.Lock()
+		defer mu.Unlock()
 		switch r.Method {
 		case http.MethodGet:
-			name := r.URL.Query().Get("name")
-			list := []interface{}{}
-			for _, role := range roles {
-				if name != "" && role.Name != name {
-					continue
-				}
-				list = append(list, map[string]interface{}{"id": role.ID, "name": role.Name})
-			}
-			err := json.NewEncoder(w).Encode(map[string]interface{}{"roles": list})
-			if err != nil {
-				log.Printf("Error encoding JSON response: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
+			list := AsList(roles, func(rl *Role) map[string]interface{} { return rl.toMap() })
+			writeJSON(w, map[string]interface{}{"roles": FilterList(list, r.URL.Query())})
 			return
 		case http.MethodPost:
 			var req struct {
 				Role struct {
-					ID   string `json:"id"`
-					Name string `json:"name"`
+					ID          string `json:"id"`
+					Name        string `json:"name"`
+					DomainID    string `json:"domain_id"`
+					Description string `json:"description"`
 				} `json:"role"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+				badRequest(w, Keystone, "Invalid request body.")
 				return
 			}
 			if req.Role.Name == "" {
-				http.Error(w, "Missing role id or name", http.StatusBadRequest)
+				badRequest(w, Keystone, "Expecting to find name in role.")
 				return
 			}
 			if req.Role.ID == "" {
 				req.Role.ID = RandomID("role")
 			}
-			rl := &Role{ID: req.Role.ID, Name: req.Role.Name}
+			rl := &Role{ID: req.Role.ID, Name: req.Role.Name,
+				DomainID: req.Role.DomainID, Description: req.Role.Description}
 			roles[req.Role.ID] = rl
-			w.WriteHeader(http.StatusCreated)
-			err := json.NewEncoder(w).Encode(map[string]interface{}{"role": rl})
-			if err != nil {
-				log.Printf("Error encoding JSON response: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
+			writeJSONStatus(w, http.StatusCreated, map[string]interface{}{"role": rl.toMap()})
 			return
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			methodNotAllowed(w, Keystone, r.Method)
 		}
 	})
 
@@ -513,44 +370,35 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 		id := path.Base(r.URL.Path)
 		rl, ok := roles[id]
 		if !ok {
-			http.NotFound(w, r)
+			notFound(w, Keystone, "Could not find role: "+id+".")
 			return
 		}
 		switch r.Method {
 		case http.MethodGet:
-			err := json.NewEncoder(w).Encode(map[string]interface{}{
-				"role": map[string]interface{}{"id": rl.ID, "name": rl.Name},
-			})
-			if err != nil {
-				log.Printf("Error encoding JSON response: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
+			writeJSON(w, map[string]interface{}{"role": rl.toMap()})
 			return
 		case http.MethodPatch, http.MethodPut:
 			var req map[string]interface{}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid JSON body", http.StatusBadRequest)
+				badRequest(w, Keystone, "Invalid request body.")
 				return
 			}
 			if rReq, ok := req["role"].(map[string]interface{}); ok {
 				if name, ok := rReq["name"].(string); ok {
 					rl.Name = name
 				}
+				if desc, ok := rReq["description"].(string); ok {
+					rl.Description = desc
+				}
 			}
-			err := json.NewEncoder(w).Encode(map[string]interface{}{
-				"user": map[string]interface{}{"id": rl.ID, "name": rl.Name},
-			})
-			if err != nil {
-				log.Printf("Error encoding JSON response: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
+			writeJSON(w, map[string]interface{}{"role": rl.toMap()})
 			return
 		case http.MethodDelete:
 			delete(roles, id)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		methodNotAllowed(w, Keystone, r.Method)
 	})
 
 	mux.HandleFunc("/v3/users", func(w http.ResponseWriter, r *http.Request) {
@@ -565,15 +413,8 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 			return
 		}
 		if r.Method == http.MethodGet {
-			name := r.URL.Query().Get("name")
-			list := []interface{}{}
-			for _, u := range users {
-				if name != "" && u.Name != name && u.ID != name {
-					continue
-				}
-				list = append(list, u.toMap(baseURL))
-			}
-			writeJSON(w, map[string]interface{}{"users": list})
+			list := AsList(users, func(u *User) map[string]interface{} { return u.toMap(baseURL) })
+			writeJSON(w, map[string]interface{}{"users": FilterList(list, r.URL.Query())})
 			return
 		}
 		if r.Method == http.MethodPost {
@@ -588,7 +429,7 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 				} `json:"user"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid JSON body", http.StatusBadRequest)
+				badRequest(w, Keystone, "Invalid request body.")
 				return
 			}
 			id := RandomID("user")
@@ -615,7 +456,7 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 		id := path.Base(r.URL.Path)
 		u, ok := users[id]
 		if !ok {
-			http.NotFound(w, r)
+			notFound(w, Keystone, "Could not find user: "+id+".")
 			return
 		}
 		switch r.Method {
@@ -625,7 +466,7 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 		case http.MethodPatch, http.MethodPut:
 			var req map[string]interface{}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid JSON body", http.StatusBadRequest)
+				badRequest(w, Keystone, "Invalid request body.")
 				return
 			}
 			if userReq, ok := req["user"].(map[string]interface{}); ok {
@@ -652,63 +493,8 @@ func RegisterKeystoneHandlers(mux *http.ServeMux, roleAssignments map[string]map
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		methodNotAllowed(w, Keystone, r.Method)
 	})
 
-	mux.HandleFunc("/v3/role_assignments", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.String())
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		q := r.URL.Query()
-		userFilter := q.Get("user.id")
-		projectFilter := q.Get("scope.project.id")
-		if projectFilter == "" {
-			projectFilter = q.Get("project.id")
-		}
-		roleFilter := q.Get("role.id")
-
-		mu.Lock()
-		list := []interface{}{}
-		for projID, userMap := range roleAssignments {
-			if projectFilter != "" && projID != projectFilter {
-				continue
-			}
-			for userID, roleIDs := range userMap {
-				if userFilter != "" && userID != userFilter {
-					continue
-				}
-				for _, roleID := range roleIDs {
-					if roleFilter != "" && roleID != roleFilter {
-						continue
-					}
-					// Populate names (keystone does this for ?include_names=True).
-					userObj := map[string]string{"id": userID}
-					if u, ok := users[userID]; ok {
-						userObj["name"] = u.Name
-						userObj["domain_id"] = u.DomainID
-					}
-					roleObj := map[string]string{"id": roleID}
-					if rl, ok := roles[roleID]; ok {
-						roleObj["name"] = rl.Name
-					}
-					projObj := map[string]interface{}{"id": projID}
-					if pr, ok := projects[projID]; ok {
-						projObj["name"] = pr.Name
-						projObj["domain_id"] = pr.DomainID
-					}
-					list = append(list, map[string]interface{}{
-						"role":  roleObj,
-						"scope": map[string]interface{}{"project": projObj},
-						"user":  userObj,
-						"links": map[string]string{"assignment": baseURL + "/v3/role_assignments"},
-					})
-				}
-			}
-		}
-		mu.Unlock()
-		writeJSON(w, map[string]interface{}{"role_assignments": list})
-	})
+	registerRoleAssignments(mux)
 }

@@ -52,16 +52,20 @@ func TestRandomID(t *testing.T) {
 }
 
 func TestBuildAddresses(t *testing.T) {
-	networks := []map[string]string{
+	// Nova keys the addresses map by network name, so a known network id
+	// resolves to its name ("net-1" is the seeded "private" network) and an
+	// unknown one is passed through as-is.
+	serverNets := []map[string]string{
 		{"uuid": "net-1"},
 		{"uuid": "net-2"},
 	}
-	addr := BuildAddresses(networks)
+	addr := BuildAddresses(serverNets)
 	require.Len(t, addr, 2)
-	require.Contains(t, addr, "net-1")
+	require.Contains(t, addr, "private")
 	require.Contains(t, addr, "net-2")
-	require.Len(t, addr["net-1"], 1)
-	require.Equal(t, "192.168.0.10", addr["net-1"][0]["addr"])
+	require.Len(t, addr["private"], 1)
+	require.Equal(t, "192.168.0.10", addr["private"][0]["addr"])
+	require.Equal(t, "fixed", addr["private"][0]["OS-EXT-IPS:type"])
 }
 
 func TestProjectIDFromToken_EmptyToken(t *testing.T) {
