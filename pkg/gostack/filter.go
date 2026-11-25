@@ -291,6 +291,20 @@ func SetAdminScope(enabled bool) {
 	adminScope = enabled
 }
 
+// strictResponses makes responses match the real services exactly where
+// doing so returns *less* than gostack historically did — a summary
+// listing instead of a detailed one, a creation response holding only what
+// Nova sends back, a 202 where gostack used to answer 204. Clients built
+// against gostack read fields and statuses the real services do not
+// provide there, so this is off unless the devstack profile is selected.
+var strictResponses bool
+
+// SetStrictResponses selects whether responses are trimmed to what the
+// real services return.
+func SetStrictResponses(enabled bool) {
+	strictResponses = enabled
+}
+
 // ShowAllProjects reports whether a listing should ignore the token's
 // project scope: either because admin scope is on, or because the client
 // named a project (or asked for all of them) itself.

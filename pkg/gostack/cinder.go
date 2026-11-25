@@ -132,7 +132,7 @@ func serveVolumes(w http.ResponseWriter, r *http.Request, p []string, projectID 
 			list = FilterList(list, r.URL.Query(), "metadata")
 			list = filterByMetadataQuery(list, r)
 			list = ApplyLimit(list, r.URL.Query())
-			if !detail {
+			if !detail && strictResponses {
 				list = briefVolumes(list)
 			}
 			writeJSON(w, map[string]interface{}{"volumes": list})
@@ -210,7 +210,7 @@ func serveVolumes(w http.ResponseWriter, r *http.Request, p []string, projectID 
 		delete(volumes, volID)
 		mu.Unlock()
 		log.Printf("Deleted volume %s", volID)
-		w.WriteHeader(http.StatusAccepted)
+		w.WriteHeader(deleteStatus())
 	default:
 		methodNotAllowed(w, Cinder, r.Method)
 	}
@@ -1100,7 +1100,9 @@ func volumeTypeEncryption(w http.ResponseWriter, r *http.Request, typeID string,
 }
 
 // briefVolumes reduces a volume listing to the summary form Cinder returns
-// from /volumes, as opposed to /volumes/detail.
+// from /volumes, as opposed to /volumes/detail. Only used under strict
+// responses: clients built against gostack read a volume's status straight
+// out of the plain listing.
 func briefVolumes(list []map[string]interface{}) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(list))
 	for _, v := range list {

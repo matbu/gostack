@@ -628,16 +628,23 @@ func createServer(w http.ResponseWriter, r *http.Request, projectID string) {
 		}
 	}(id)
 
-	// Nova's create response is a short form: id, links and security groups.
-	writeJSONStatus(w, http.StatusAccepted, map[string]interface{}{
-		"server": map[string]interface{}{
-			"id":                id,
-			"links":             body["links"],
-			"security_groups":   body["security_groups"],
-			"adminPass":         "fakeAdminPass",
-			"OS-DCF:diskConfig": "MANUAL",
-		},
-	})
+	// Nova's create response is a short form: id, links and security
+	// groups. Clients built against gostack read the whole server out of
+	// it, so the full object is returned unless responses are strict.
+	if strictResponses {
+		writeJSONStatus(w, http.StatusAccepted, map[string]interface{}{
+			"server": map[string]interface{}{
+				"id":                id,
+				"links":             body["links"],
+				"security_groups":   body["security_groups"],
+				"adminPass":         "fakeAdminPass",
+				"OS-DCF:diskConfig": "MANUAL",
+			},
+		})
+		return
+	}
+	body["adminPass"] = "fakeAdminPass"
+	writeJSONStatus(w, http.StatusAccepted, map[string]interface{}{"server": body})
 }
 
 // resolveFlavorRef turns a flavor name into its id, leaving ids untouched.
@@ -970,7 +977,7 @@ func serverInterface(w http.ResponseWriter, r *http.Request, srvID string, p []s
 				port["device_owner"] = nil
 				port["status"] = "DOWN"
 				mu.Unlock()
-				w.WriteHeader(http.StatusAccepted)
+				w.WriteHeader(deleteStatus())
 				return
 			}
 		}
@@ -1081,7 +1088,7 @@ func serverVolumeAttachments(w http.ResponseWriter, r *http.Request, srvID strin
 		if len(vol.Attachments) == 0 {
 			vol.Status = "available"
 		}
-		w.WriteHeader(http.StatusAccepted)
+		w.WriteHeader(deleteStatus())
 	default:
 		methodNotAllowed(w, Nova, r.Method)
 	}

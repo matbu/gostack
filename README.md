@@ -37,8 +37,14 @@ them, so existing callers are unaffected by the default:
 - `devstack`: what a freshly stacked devstack has — a cirros image, the
   `private`/`public`/`shared` networks with subnets, a default security
   group, devstack's projects, and nothing else. Listings span all projects
-  (matching the admin role the token carries) and a token is required. Use
+  (matching the admin role the token carries), a token is required, and
+  responses carry exactly what the real services send — including the few
+  places where that is *less* than gostack has historically returned. Use
   this for clients written against a real cloud.
+
+The fixes that can only help a client — error envelopes, JSON content
+types, query filters, stable ordering, fuller resource field sets, the
+Cinder/Keystone namespace split — apply under both profiles.
 
 ## API conformance
 

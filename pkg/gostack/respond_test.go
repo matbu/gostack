@@ -186,3 +186,16 @@ func TestServiceForPath(t *testing.T) {
 	assert.Equal(t, Glance, serviceForPath("/v2/images"))
 	assert.Equal(t, Keystone, serviceForPath("/v3/projects"))
 }
+
+func TestDeleteStatusFollowsProfile(t *testing.T) {
+	t.Cleanup(func() { SetStrictResponses(false) })
+
+	// Clients built against gostack assert on 204, so the default keeps
+	// sending it; the real services answer an asynchronous delete with
+	// 202, which strict responses restore.
+	SetStrictResponses(false)
+	assert.Equal(t, http.StatusNoContent, deleteStatus())
+
+	SetStrictResponses(true)
+	assert.Equal(t, http.StatusAccepted, deleteStatus())
+}

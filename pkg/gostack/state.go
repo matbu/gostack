@@ -206,9 +206,11 @@ func ApplySeedProfile(profile string) {
 	if profile != SeedDevstack {
 		return
 	}
-	// A suite written against a real cloud authenticates as admin and
-	// lists resources across projects.
+	// A suite written against a real cloud authenticates as admin, lists
+	// resources across projects, and expects responses to carry exactly
+	// what the real services send.
 	SetAdminScope(true)
+	SetStrictResponses(true)
 	mu.Lock()
 	defer mu.Unlock()
 

@@ -179,3 +179,13 @@ func methodNotAllowed(w http.ResponseWriter, svc Service, method string) {
 func badRequest(w http.ResponseWriter, svc Service, message string) {
 	apiError(w, svc, http.StatusBadRequest, message)
 }
+
+// deleteStatus is the status an asynchronous delete answers with: the 202
+// Nova and Cinder really send under strict responses, or the 204 gostack
+// has always sent otherwise. Clients built against gostack assert on 204.
+func deleteStatus() int {
+	if strictResponses {
+		return http.StatusAccepted
+	}
+	return http.StatusNoContent
+}
