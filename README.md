@@ -49,9 +49,19 @@ Cinder/Keystone namespace split — apply under both profiles.
 ## API conformance
 
 [`docs/api-conformance.md`](docs/api-conformance.md) records how closely
-gostack follows the real APIs, which services it covers, what is missing,
-and how to re-measure it against the upstream
-`ansible-collections-openstack` functional test suite.
+gostack follows the real APIs, which services it covers, and what is
+missing.
+
+It is measured by running the upstream `ansible-collections-openstack`
+functional test roles against a build:
+
+```bash
+make conformance-test
+```
+
+That needs `ansible-core`, `openstacksdk` and `python-openstackclient` on
+`PATH`. The same run happens in CI on every pull request, and weekly
+against the collection's master branch.
 
 ### As a Go package
 

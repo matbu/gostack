@@ -1,0 +1,90 @@
+name: openstack.cloud conformance tests
+
+# Runs the upstream openstack.cloud functional test roles against the gostack
+# build from THIS pull request.
+#
+# These are the broadest client-side exercise of the OpenStack APIs that can be
+# pointed at an arbitrary endpoint: one role per module, all driven through
+# openstacksdk. A gostack change that stops looking like a real cloud to a real
+# client is caught here, where os-migrate's and VMK's suites only cover the
+# calls those two projects happen to make.
+#
+# The roles live in ci/roles, not tests/ (which holds unit and sanity checks).
+# tests/conformance/run-roles.sh does the setup and runs them; see
+# docs/api-conformance.md for what is covered and what is deliberately left out.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  # Upstream moves independently of this repository, so a weekly run catches
+  # drift that no pull request here would.
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      roles:
+        description: "Space-separated roles to run (default: the full set)"
+        required: false
+        type: string
+      osa_ref:
+        description: "ansible-collections-openstack branch to test against"
+        required: false
+        default: master
+        type: string
+
+jobs:
+  conformance:
+    name: openstack.cloud roles against this gostack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out gostack (this PR)
+        uses: actions/checkout@v4
+
+      - name: Check out ansible-collections-openstack
+        uses: actions/checkout@v4
+        with:
+          repository: openstack/ansible-collections-openstack
+          ref: ${{ inputs.osa_ref || 'master' }}
+          path: ansible-collections-openstack
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build this PR's gostack
+        run: go build -v -o bin/fake-openstack ./cmd/fake-openstack
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # python-openstackclient is not optional: the floating_ip role
+          # shells out to the `openstack` CLI for one of its steps.
+          pip install ansible-core openstacksdk python-openstackclient
+
+      - name: Run openstack.cloud roles against this gostack
+        env:
+          GOSTACK_BIN: ${{ github.workspace }}/bin/fake-openstack
+          OSA_SRC: ${{ github.workspace }}/ansible-collections-openstack
+          CONFORMANCE_ROLES: ${{ inputs.roles }}
+          CONFORMANCE_WORKDIR: ${{ runner.temp }}/conformance
+        run: bash tests/conformance/run-roles.sh
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs
+          path: ${{ runner.temp }}/conformance/*.log
+          retention-days: 7
+          if-no-files-found: ignore
