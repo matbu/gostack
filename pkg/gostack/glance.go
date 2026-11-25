@@ -46,10 +46,9 @@ func RegisterGlanceHandlers(mux *http.ServeMux) {
 					projectImages = append(projectImages, img)
 				case visibility == "public" || visibility == "community":
 					publicImages = append(publicImages, img)
-				default:
-					// gostack issues an admin-scoped token, so another
-					// project's private images are visible too, as they
-					// are to an admin in a real cloud.
+				case adminScope:
+					// With admin scope another project's private images
+					// are visible too, as they are to an admin.
 					otherImages = append(otherImages, img)
 				}
 			}
@@ -201,8 +200,15 @@ func RegisterGlanceHandlers(mux *http.ServeMux) {
 		enrichImage(img, projectID)
 		switch r.Method {
 		case http.MethodGet:
-			// An admin token reads any image, whoever owns it.
-			writeJSON(w, img)
+			// With admin scope any image is readable, whoever owns it.
+			visibility, _ := img["visibility"].(string)
+			owner, _ := img["owner"].(string)
+			if adminScope || visibility == "public" ||
+				visibility == "community" || owner == projectID {
+				writeJSON(w, img)
+				return
+			}
+			notFound(w, Glance, "Image "+id)
 		case http.MethodPatch:
 			// application/openstack-images-v2.1-json-patch : array of ops.
 			var ops []map[string]interface{}

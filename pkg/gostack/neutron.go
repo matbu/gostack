@@ -93,9 +93,13 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 			if handleTags(w, r, parts, n) {
 				return
 			}
-			// Reading by id is not project-scoped: gostack issues an
-			// admin token, and clients fetch another project's resource
-			// by the id they already hold. Listings stay scoped.
+			// With admin scope, reading by id is not project-scoped:
+			// clients fetch another project's resource by an id they
+			// already hold, as an admin may. Listings stay scoped.
+			if !adminScope && n["project_id"] != projectID && !networkVisible(n) {
+				notFound(w, Neutron, "Network "+id)
+				return
+			}
 			switch r.Method {
 			case http.MethodDelete:
 				networks = append(networks[:i], networks[i+1:]...)
@@ -189,6 +193,10 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 			}
 			enrichSubnet(s, projectID)
 			if handleTags(w, r, parts, s) {
+				return
+			}
+			if !adminScope && s["project_id"] != projectID && !subnetVisible(s) {
+				notFound(w, Neutron, "Subnet "+id)
 				return
 			}
 			switch r.Method {
@@ -285,6 +293,10 @@ func RegisterNeutronHandlers(mux *http.ServeMux) {
 			}
 			enrichPort(p, projectID)
 			if handleTags(w, r, parts, p) {
+				return
+			}
+			if !adminScope && p["project_id"] != projectID {
+				notFound(w, Neutron, "Port "+id)
 				return
 			}
 			switch r.Method {

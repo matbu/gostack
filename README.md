@@ -20,20 +20,25 @@ make build && ./bin/fake-openstack
 - `--log-level` (debug, info, warn, error)
 - `--base-url` (default: http://bind:port)
 - `--seed` (default: osmigrate) — which sample resources to start with
-- `--allow-anonymous` (default: false) — serve requests that carry no token
-  instead of answering 401
+- `--require-auth` — answer requests without a valid token with 401
+  (default: only under `--seed devstack`)
 
 Environment: `GOSTACK_PORT`, `GOSTACK_BIND`, etc.
 
 ### Seed profiles
 
+The profile selects the sample resources *and* the behaviours that go with
+them, so existing callers are unaffected by the default:
+
 - `osmigrate` (default): the fixtures os-migrate's export tests read — a
-  volume, an SR-IOV port, the `private`/`public` networks. Listings are
-  scoped to the token's project.
+  volume, an SR-IOV port, the `private`/`public` networks, the
+  `source`/`destination` projects. Listings and reads are scoped to the
+  token's project, and requests without a token are served.
 - `devstack`: what a freshly stacked devstack has — a cirros image, the
   `private`/`public`/`shared` networks with subnets, a default security
-  group, and nothing else. Listings span all projects, matching the admin
-  role the token carries. Use this for clients written against a real cloud.
+  group, devstack's projects, and nothing else. Listings span all projects
+  (matching the admin role the token carries) and a token is required. Use
+  this for clients written against a real cloud.
 
 ## API conformance
 

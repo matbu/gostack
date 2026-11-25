@@ -74,19 +74,18 @@ var (
 var (
 	servers  = map[string]*Server{}
 	serverID = 1
-	// Flavor names follow devstack's defaults so upstream test suites that
-	// assume m1.tiny and friends can run unchanged.
+	// The original flavors keep ids 1-3: os-migrate and the VMware
+	// migration kit assert on them by id, so these must not be renumbered.
+	// devstack's m1.* names are appended for suites that assume them.
 	flavors = []map[string]interface{}{
-		{"id": "1", "name": "m1.tiny", "ram": 512, "vcpus": 1, "disk": 1},
-		{"id": "2", "name": "m1.small", "ram": 2048, "vcpus": 1, "disk": 20},
-		{"id": "3", "name": "m1.medium", "ram": 4096, "vcpus": 2, "disk": 40},
-		{"id": "4", "name": "m1.large", "ram": 8192, "vcpus": 4, "disk": 80},
-		{"id": "5", "name": "m1.xlarge", "ram": 16384, "vcpus": 8, "disk": 160},
-		// Retained from the original seed data: os-migrate's own tests use
-		// these names.
-		{"id": "6", "name": "small", "ram": 2048, "vcpus": 1, "disk": 20},
-		{"id": "7", "name": "medium", "ram": 4096, "vcpus": 2, "disk": 40},
-		{"id": "8", "name": "large", "ram": 8192, "vcpus": 4, "disk": 80},
+		{"id": "1", "name": "small", "ram": 2048, "vcpus": 1, "disk": 20},
+		{"id": "2", "name": "medium", "ram": 4096, "vcpus": 2, "disk": 40},
+		{"id": "3", "name": "large", "ram": 8192, "vcpus": 4, "disk": 80},
+		{"id": "4", "name": "m1.tiny", "ram": 512, "vcpus": 1, "disk": 1},
+		{"id": "5", "name": "m1.small", "ram": 2048, "vcpus": 1, "disk": 20},
+		{"id": "6", "name": "m1.medium", "ram": 4096, "vcpus": 2, "disk": 40},
+		{"id": "7", "name": "m1.large", "ram": 8192, "vcpus": 4, "disk": 80},
+		{"id": "8", "name": "m1.xlarge", "ram": 16384, "vcpus": 8, "disk": 160},
 	}
 	flavorExtraSpecs = map[string]map[string]string{
 		"osm_flavor": {},

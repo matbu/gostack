@@ -432,10 +432,15 @@ func serveServers(w http.ResponseWriter, r *http.Request, p []string, projectID,
 
 	switch r.Method {
 	case http.MethodGet:
-		// Reading a server by id is not project-scoped: gostack issues an
-		// admin token, and clients fetch servers found through an
-		// all-projects listing by id alone.
+		// With admin scope, reading a server by id is not project-scoped:
+		// clients fetch servers found through an all-projects listing by
+		// id alone.
 		mu.Lock()
+		if !adminScope && s.Project != "" && projectID != "" && s.Project != projectID {
+			mu.Unlock()
+			notFound(w, Nova, "Instance "+srvID)
+			return
+		}
 		body := s.toMap()
 		mu.Unlock()
 		writeJSON(w, map[string]interface{}{"server": body})

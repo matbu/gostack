@@ -44,8 +44,8 @@ Runs from any directory; no chdir required.`,
 	rootCmd.PersistentFlags().String("base-url", "", "Base URL for catalog (default: http://bind:port)")
 	rootCmd.PersistentFlags().String("seed", "osmigrate",
 		"Sample resources to start with: osmigrate or devstack")
-	rootCmd.PersistentFlags().Bool("allow-anonymous", false,
-		"Serve requests without an auth token instead of answering 401")
+	rootCmd.PersistentFlags().Bool("require-auth", false,
+		"Answer requests without a valid token with 401 (default: only with --seed devstack)")
 
 	_ = viper.BindPFlag("port", rootCmd.PersistentFlags().Lookup("port"))
 	_ = viper.BindPFlag("base_url", rootCmd.PersistentFlags().Lookup("base-url"))
@@ -53,7 +53,7 @@ Runs from any directory; no chdir required.`,
 	_ = viper.BindPFlag("pid_file", rootCmd.PersistentFlags().Lookup("pid-file"))
 	_ = viper.BindPFlag("log_level", rootCmd.PersistentFlags().Lookup("log-level"))
 	_ = viper.BindPFlag("seed", rootCmd.PersistentFlags().Lookup("seed"))
-	_ = viper.BindPFlag("allow_anonymous", rootCmd.PersistentFlags().Lookup("allow-anonymous"))
+	_ = viper.BindPFlag("require_auth", rootCmd.PersistentFlags().Lookup("require-auth"))
 
 	viper.SetEnvPrefix("GOSTACK")
 	viper.AutomaticEnv()
@@ -79,12 +79,16 @@ func runServe(cmd *cobra.Command, _ []string) {
 	}
 
 	opts := gostack.Options{
-		BindAddr:       bind,
-		Port:           port,
-		PIDFile:        pidFile,
-		BaseURL:        baseURL,
-		SeedProfile:    viper.GetString("seed"),
-		AllowAnonymous: viper.GetBool("allow_anonymous"),
+		BindAddr:    bind,
+		Port:        port,
+		PIDFile:     pidFile,
+		BaseURL:     baseURL,
+		SeedProfile: viper.GetString("seed"),
+	}
+	// Only an explicit flag overrides what the seed profile implies.
+	if cmd.Flags().Changed("require-auth") {
+		requireAuth := viper.GetBool("require_auth")
+		opts.RequireAuth = &requireAuth
 	}
 
 	fs := gostack.NewFakeServer(opts)

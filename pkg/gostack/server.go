@@ -33,10 +33,11 @@ type Options struct {
 	PIDFile string
 	// BaseURL is the base URL for catalog/links (e.g. "http://127.0.0.1:5000").
 	BaseURL string
-	// AllowAnonymous serves requests that carry no X-Auth-Token. The real
-	// services answer those with a 401; leave this false unless a client
-	// cannot authenticate.
-	AllowAnonymous bool
+	// RequireAuth answers requests without a valid X-Auth-Token with a
+	// 401, as the real services do. nil follows the seed profile: the
+	// devstack profile requires a token, the default one does not, so
+	// existing callers keep working.
+	RequireAuth *bool
 	// SeedProfile selects the sample resources the cloud starts with:
 	// SeedOSMigrate (the default) or SeedDevstack.
 	SeedProfile string
@@ -109,9 +110,14 @@ func NewFakeServer(opts Options) *FakeServer {
 	addr := fmt.Sprintf("%s:%d", opts.BindAddr, opts.Port)
 	fs := &FakeServer{URL: "http://" + addr, PIDFile: opts.PIDFile}
 
+	requireAuth := opts.SeedProfile == SeedDevstack
+	if opts.RequireAuth != nil {
+		requireAuth = *opts.RequireAuth
+	}
+
 	var handler http.Handler = mux
 	handler = Microversion(handler)
-	if !opts.AllowAnonymous {
+	if requireAuth {
 		handler = RequireToken(handler)
 	}
 	handler = Recover(NormalizeV2Path(handler))
